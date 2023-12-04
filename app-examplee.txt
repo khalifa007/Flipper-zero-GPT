@@ -1608,6 +1608,365 @@ int32_t bmi_calculator_app(void) {
 }
 
 
+- Simple tone generator for the flipper zero
+
+
+Up / Down: Frequency
+Left / Right: Volume
+OK: Play tone
+Back: Exit
+
+#include <furi.h>
+#include <furi_hal.h>
+#include <gui/gui.h>
+#include <input/input.h>
+#include <stdlib.h>
+
+float freq = 500.f;
+int volume = 100;
+
+static void draw_callback(Canvas* canvas, void* ctx) {
+    UNUSED(ctx);
+    canvas_clear(canvas);
+    canvas_draw_frame(canvas, 0, 0, 128, 64);
+
+    char txtBufferTone[16];
+    snprintf(txtBufferTone, 16, "Tone: %0.2fHz", (double)freq);
+
+    char txtBufferVol[16];
+    snprintf(txtBufferVol, 16, "Volume: %i%%", volume);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 7, 15, "Tone generator");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 7, 30, txtBufferTone);
+    canvas_draw_str(canvas, 7, 40, txtBufferVol);
+}
+
+static void input_callback(InputEvent* input_event, void* ctx) {
+    furi_assert(ctx);
+    FuriMessageQueue* event_queue = ctx;
+    furi_message_queue_put(event_queue, input_event, FuriWaitForever);
+}
+
+int32_t tonegen_app(void* p) { 
+    UNUSED(p);
+
+    InputEvent event;
+    FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
+
+    ViewPort* view_port = view_port_alloc();
+    view_port_draw_callback_set(view_port, draw_callback, NULL);
+    view_port_input_callback_set(view_port, input_callback, event_queue);
+
+    Gui* gui = furi_record_open(RECORD_GUI);
+    gui_add_view_port(gui, view_port, GuiLayerFullscreen);
+    void* speaker = (void*)furi_hal_speaker_acquire(1000);
+
+    //furi_hal_subghz_reset();
+    //furi_hal_subghz_load_preset(FuriHalSubGhzPreset2FSKDev476Async);
+
+    //uint32_t frequency = 433920000;
+    //frequency = furi_hal_subghz_set_frequency_and_path(frequency);
+
+    while(true) {
+        furi_check(furi_message_queue_get(event_queue, &event, FuriWaitForever) == FuriStatusOk);
+
+        if(event.type == InputTypePress){
+            if(event.key == InputKeyBack) {
+                break;
+            }
+            if(event.key == InputKeyUp) {
+                if(freq < 2500.f){
+                    freq += 25.f;
+                }
+            }
+            if(event.key == InputKeyDown) {
+                if(freq > 100.f){
+                    freq -= 25.f;
+                }
+            }
+            if(event.key == InputKeyRight) {
+                if(volume < 100){
+                    volume += 5;
+                }
+            }
+            if(event.key == InputKeyLeft) {
+                if(volume > 5){
+                    volume -= 5;
+                }
+            }
+            if(event.key == InputKeyOk) {
+                //furi_hal_subghz_tx();
+                furi_hal_speaker_start(freq, (float)(volume / 100.f));
+            }
+        } 
+        else if(event.type == InputTypeRelease) {
+            //furi_hal_subghz_idle(); //end carrier
+            furi_hal_speaker_stop(); //end tone
+        }
+    }
+
+    furi_hal_speaker_release(speaker);
+    furi_message_queue_free(event_queue);
+    gui_remove_view_port(gui, view_port);
+    view_port_free(view_port);
+    furi_record_close(RECORD_GUI);
+
+    return 0;
+}
+
+
+
+
+- Now you can use the pin B2 to turn on another LED or in my case a laser module by using GPIO pins in flipper zereo source code : 
+
+
+#include <furi.h>
+#include <furi_hal_power.h>
+#include <gui/gui.h>
+#include <input/input.h>
+#include <stdlib.h>
+#include <gui/elements.h>
+
+typedef enum {
+    EventTypeTick,
+    EventTypeKey,
+} EventType;
+
+typedef struct {
+    EventType type;
+    InputEvent input;
+} PluginEvent;
+
+typedef struct {
+    FuriMutex* mutex;
+    bool is_on;
+} PluginState;
+
+static void render_callback(Canvas* const canvas, void* ctx) {
+    furi_assert(ctx);
+    const PluginState* plugin_state = ctx;
+    furi_mutex_acquire(plugin_state->mutex, FuriWaitForever);
+
+    canvas_set_font(canvas, FontPrimary);
+    elements_multiline_text_aligned(canvas, 64, 2, AlignCenter, AlignTop, "Laser");
+
+    canvas_set_font(canvas, FontSecondary);
+
+    if(!plugin_state->is_on) {
+        elements_multiline_text_aligned(
+            canvas, 64, 28, AlignCenter, AlignTop, "Press OK button turn laser on");
+    } else {
+        elements_multiline_text_aligned(canvas, 64, 28, AlignCenter, AlignTop, "Laser is on :) !");
+        elements_multiline_text_aligned(
+            canvas, 64, 40, AlignCenter, AlignTop, "Press OK button to turn off");
+    }
+
+    furi_mutex_release(plugin_state->mutex);
+}
+
+static void input_callback(InputEvent* input_event, FuriMessageQueue* event_queue) {
+    furi_assert(event_queue);
+
+    PluginEvent event = {.type = EventTypeKey, .input = *input_event};
+    furi_message_queue_put(event_queue, &event, FuriWaitForever);
+}
+
+static void flash_toggle(PluginState* const plugin_state) {
+    furi_hal_gpio_write(&gpio_ext_pb2, false);
+    furi_hal_gpio_init(&gpio_ext_pb2, GpioModeOutputPushPull, GpioPullNo, GpioSpeedVeryHigh);
+
+    if(plugin_state->is_on) {
+        furi_hal_gpio_write(&gpio_ext_pb2, false);
+        plugin_state->is_on = false;
+    } else {
+        furi_hal_gpio_write(&gpio_ext_pb2, true);
+        plugin_state->is_on = true;
+    }
+}
+
+int32_t laser_app() {
+    FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(PluginEvent));
+
+    PluginState* plugin_state = malloc(sizeof(PluginState));
+
+    plugin_state->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!plugin_state->mutex) {
+        FURI_LOG_E("laser", "cannot create mutex\r\n");
+        furi_message_queue_free(event_queue);
+        free(plugin_state);
+        return 255;
+    }
+
+    // Set system callbacks
+    ViewPort* view_port = view_port_alloc();
+    view_port_draw_callback_set(view_port, render_callback, plugin_state);
+    view_port_input_callback_set(view_port, input_callback, event_queue);
+
+    // Open GUI and register view_port
+    Gui* gui = furi_record_open(RECORD_GUI);
+    gui_add_view_port(gui, view_port, GuiLayerFullscreen);
+
+    PluginEvent event;
+    for(bool processing = true; processing;) {
+        FuriStatus event_status = furi_message_queue_get(event_queue, &event, 100);
+
+        furi_mutex_acquire(plugin_state->mutex, FuriWaitForever);
+
+        if(event_status == FuriStatusOk) {
+            // press events
+            if(event.type == EventTypeKey) {
+                if(event.input.type == InputTypePress) {
+                    switch(event.input.key) {
+                    case InputKeyUp:
+                    case InputKeyDown:
+                    case InputKeyRight:
+                    case InputKeyLeft:
+                        break;
+                    case InputKeyOk:
+                        flash_toggle(plugin_state);
+                        break;
+                    case InputKeyBack:
+                        processing = false;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+        }
+
+        view_port_update(view_port);
+        furi_mutex_release(plugin_state->mutex);
+    }
+
+    view_port_enabled_set(view_port, false);
+    gui_remove_view_port(gui, view_port);
+    furi_record_close(RECORD_GUI);
+    view_port_free(view_port);
+    furi_message_queue_free(event_queue);
+    furi_mutex_free(plugin_state->mutex);
+
+    return 0;
+}
+
+ - Beeps if a wire is continuous , using GPIO pins in flipper zereo so is 6 (B2) connected to 8 (GND ) device will Beeps and make led green in flipper.  source code :
+
+#include <furi.h>
+#include <furi_hal.h>
+#include <gui/gui.h>
+#include <input/input.h>
+#include <notification/notification.h>
+#include <notification/notification_messages.h>
+
+#include <stdlib.h>
+
+#include "wire_tester_icons.h"
+
+
+//#define TAG "wire_tester"
+
+
+static const uint32_t EVENT_PERIOD_MS = 10; // check for input changes often
+static const float BEEP_FREQ = 2400.0f; // louder than other frequencies
+static const float BEEP_VOL = 0.8f;
+static const GpioPin* const INPUT_PIN = &gpio_ext_pb2; // pin 6
+
+
+static void start_feedback(NotificationApp* notifications) {
+    // set LED to green
+    notification_message_block(notifications, &sequence_set_only_green_255);
+
+    // start beep
+    if (furi_hal_speaker_acquire(1000)) {
+         furi_hal_speaker_start(BEEP_FREQ, BEEP_VOL);
+    }
+}
+
+static void stop_feedback(NotificationApp* notifications) {
+    // clear LED
+    notification_message_block(notifications, &sequence_reset_rgb);
+
+    // stop beep
+    if (furi_hal_speaker_is_mine()) {
+        furi_hal_speaker_stop();
+        furi_hal_speaker_release();
+    }
+}
+
+static void draw_callback(Canvas* canvas, void* ctx) {
+    furi_assert(ctx);
+    canvas_clear(canvas);
+    canvas_draw_icon(canvas, 0, 0, &I_background_128x64);
+}
+
+static void input_callback(InputEvent* input_event, void* ctx) {
+    furi_assert(ctx);
+    FuriMessageQueue* event_queue = ctx;
+    furi_message_queue_put(event_queue, input_event, FuriWaitForever);
+}
+
+int32_t app_main(void* p) {
+    UNUSED(p);
+    FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
+
+    // force backlight on because our hands will be busy with wires
+    NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
+    notification_message_block(notifications, &sequence_display_backlight_enforce_on);
+
+    ViewPort* view_port = view_port_alloc();
+    view_port_draw_callback_set(view_port, draw_callback, view_port);
+    view_port_input_callback_set(view_port, input_callback, event_queue);
+
+    Gui* gui = furi_record_open(RECORD_GUI);
+    gui_add_view_port(gui, view_port, GuiLayerFullscreen);
+    view_port_update(view_port);
+
+    stop_feedback(notifications);
+
+    // set input to be normally high; it will be low when shorted to ground
+    furi_hal_gpio_init(INPUT_PIN, GpioModeInput, GpioPullUp, GpioSpeedLow);
+
+    bool alarming = false;
+    bool running = true;
+    while (running) {
+        // start and stop feedback on the transition
+        bool continuous = !furi_hal_gpio_read(INPUT_PIN);
+        if (continuous && !alarming) {
+            start_feedback(notifications);
+        } else if (!continuous && alarming) {
+            stop_feedback(notifications);
+        }
+        alarming = continuous;
+
+        // exit on back key
+        InputEvent event;
+        if (furi_message_queue_get(event_queue, &event, EVENT_PERIOD_MS) == FuriStatusOk) {
+            if ((event.type == InputTypePress || event.type == InputTypeRepeat)
+                    && event.key == InputKeyBack) {
+                running = false;
+            }
+        }
+    }
+
+    // return control of the LED, beeper, and backlight
+    stop_feedback(notifications);
+    notification_message_block(notifications, &sequence_display_backlight_enforce_auto);
+
+    view_port_enabled_set(view_port, false);
+    gui_remove_view_port(gui, view_port);
+    view_port_free(view_port);
+
+    furi_message_queue_free(event_queue);
+    furi_record_close(RECORD_GUI);
+    furi_record_close(RECORD_NOTIFICATION);
+
+    return 0;
+}
+
+
+
 
 
 
